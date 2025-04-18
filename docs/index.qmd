@@ -124,132 +124,80 @@ print(wf_status %>% select(wflow_id, success))
 wf_clean <- wf_status %>% filter(success)
 ```
 
-## Q4e: Evaluation 
-
+## Q4e/Q4f: Evaluation and Extract
 ```{r}
-if (nrow(wf_clean) > 0) {
+if (exists("wf_clean") && is.data.frame(wf_clean) && nrow(wf_clean) > 0) {
   autoplot(wf_clean)
-  rank_results(wf_clean, rank_metric = "rsq", select_best = TRUE)
+  
+  best_model_info <- rank_results(wf_clean, rank_metric = "rsq", select_best = TRUE)
+  print(best_model_info)
+  
+  best_id <- best_model_info$wflow_id[[1]]
 } else {
-  message("No workflows returned results — check your models or preprocessing.")
+  stop("No workflows returned results — check your models or preprocessing.")
 }
-```
 
-## Q4f: Extract and Evaluate 
-```{r}
-if (nrow(wf_clean) > 0) {
-  autoplot(wf_clean)
-  rank_results(wf_clean, rank_metric = "rsq", select_best = TRUE)
-} else {
-  message("No workflows returned results — check your models or preprocessing.")
-}
-```
-
-```{r}
+## Check model inputs and download CAMELS if needed
 if (!exists("camels") | !exists("camels_train") | !exists("rec")) {
+  library(glue)
   root <- 'https://gdex.ucar.edu/dataset/camels/file'
   types <- c("clim", "geol", "soil", "topo", "vege", "hydro")
-  remote_files  <- glue('{root}/camels_{types}.txt')
-  local_files   <- glue('data/camels_{types}.txt')
-
+  remote_files <- glue('{root}/camels_{types}.txt')
+  local_files  <- glue('data/camels_{types}.txt')
   dir.create("data", showWarnings = FALSE)
-
+  
   walk2(remote_files, local_files, download.file, quiet = TRUE)
-
+  
   camels <- map(local_files, read_delim, show_col_types = FALSE) |> 
-    power_full_join(by = 'gauge_id') |> 
+    reduce(powerjoin::power_full_join, by = "gauge_id") |> 
     mutate(logQmean = log(q_mean))
-
+  
   set.seed(123)
   camels_split <- initial_split(camels, prop = 0.8)
   camels_train <- training(camels_split)
-  camels_test <- testing(camels_split)
-  camels_cv <- vfold_cv(camels_train, v = 10)
-
+  camels_test  <- testing(camels_split)
+  camels_cv    <- vfold_cv(camels_train, v = 10)
+  
   rec <- recipe(logQmean ~ aridity + p_mean, data = camels_train) %>%
     step_log(all_predictors()) %>%
     step_interact(terms = ~ aridity:p_mean) %>%
     step_naomit(all_predictors(), all_outcomes())
 }
 
-if (!exists("wf_clean")) {
-  lm_model <- linear_reg() %>%
-    set_engine("lm") %>%
-    set_mode("regression")
-
-  xgb_model <- boost_tree() %>%
-    set_engine("xgboost") %>%
-    set_mode("regression")
-
-  nnet_model <- bag_mlp() %>%
-    set_engine("nnet") %>%
-    set_mode("regression")
-
-  wf <- workflow_set(
-    preproc = list(rec),
-    models = list(
-      linear_reg = lm_model,
-      xgboost = xgb_model,
-      neural_net = nnet_model
-    )
-  ) %>%
-    workflow_map("fit_resamples", resamples = camels_cv, verbose = TRUE)
-
-  wf <- wf %>%
-    mutate(success = map_lgl(result, ~ inherits(.x, "resample_results")))
-
-  wf_clean <- wf %>% filter(success)
-}
-
-print("Available workflows:")
-print(wf_clean$wflow_id)
-
-all_metrics <- wf_clean %>%
-  mutate(metrics = map(result, collect_metrics)) %>%
-  unnest(metrics)
-
-best_id <- all_metrics %>%
-  filter(.metric == "rsq") %>%
-  arrange(desc(mean)) %>%
-  slice(1) %>%
-  pull(wflow_id)
-
-best_result <- wf_clean %>%
-  mutate(metrics = map(result, collect_metrics)) %>%
-  unnest(metrics) %>%
-  filter(.metric == "rsq") %>%
-  arrange(desc(mean)) %>%
-  slice(1) %>%
-  pull(wflow_id)
-
+## Fit best model and evaluate
 model_lookup <- list(
-  linear_reg = lm_model,
-  xgboost = xgb_model,
-  neural_net = nnet_model
+  linear_reg = linear_reg() |> set_engine("lm") |> set_mode("regression"),
+  xgboost    = boost_tree() |> set_engine("xgboost") |> set_mode("regression"),
+  neural_net = bag_mlp()    |> set_engine("nnet") |> set_mode("regression")
 )
 
-if (best_result %in% names(model_lookup)) {
+# Fix: Extract just the model name from best_id
+model_name <- str_remove(best_id, "^recipe_")
+
+# Now use it to look up the model
+if (model_name %in% names(model_lookup)) {
   best_model <- workflow() %>%
     add_recipe(rec) %>%
-    add_model(model_lookup[[best_result]]) %>%
+    add_model(model_lookup[[model_name]]) %>%
     fit(data = camels_train)
 
-  xgb_test <- augment(best_model, new_data = camels_test)
+  preds <- augment(best_model, new_data = camels_test)
 
-  print(metrics(xgb_test, truth = logQmean, estimate = .pred))
+  print(metrics(preds, truth = logQmean, estimate = .pred))
 
-  xgb_test |> 
+  preds |> 
     ggplot(aes(x = logQmean, y = .pred, color = aridity)) +
     geom_point() +
     geom_abline(linetype = 2) +
     scale_color_viridis_c() +
-    labs(title = paste0(best_result, ": Observed vs Predicted Streamflow"),
-         x = "Observed Log Mean Flow",
-         y = "Predicted Log Mean Flow",
-         color = "Aridity") +
+    labs(
+      title = paste0(model_name, ": Observed vs Predicted Streamflow"),
+      x = "Observed Log Mean Flow",
+      y = "Predicted Log Mean Flow",
+      color = "Aridity"
+    ) +
     theme_linedraw()
 } else {
-  message("Best result for '", best_result, "' is NULL or missing. Skipping model evaluation.")
+  stop(paste0("Model name '", model_name, "' not found in model lookup."))
 }
 ```
-

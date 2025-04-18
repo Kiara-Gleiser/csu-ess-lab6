@@ -1,0 +1,365 @@
+---
+title: "Hyperparameter Tuning - CAMELS Dataset"
+format: html
+editor: visual
+---
+
+```{r setup, include=FALSE}
+if (!require("ranger")) install.packages("ranger")
+if (!require("xgboost")) install.packages("xgboost")
+
+library(tidyverse)
+library(tidymodels)
+library(skimr)
+library(visdat)
+library(ggpubr)
+library(patchwork)
+library(powerjoin)
+library(ranger)
+library(xgboost)
+``` 
+
+## Data Import/Tidy/Transform
+```{r}
+camels_path <- "/Users/kiaragleiser/ESS330/git/csu-ess-lab6/data"
+
+file_paths <- list.files(camels_path, full.names = TRUE) %>%
+  keep(~ grepl("camels_.*\\.txt$", basename(.x), ignore.case = TRUE))
+
+data_list <- map(file_paths, ~ tryCatch(
+  read_delim(.x, show_col_types = FALSE),
+  error = function(e) {
+    message("Failed to read file: ", .x)
+    tibble()
+  }
+))
+
+camels_raw <- reduce(keep(data_list, ~ nrow(.x) > 0), power_full_join, by = "gauge_id")
+
+skim_with(numeric = list(hist = NULL), integer = list(hist = NULL))
+skim(camels_raw) %>%
+  as_tibble() %>%
+  select(-skim_type, -n_missing, -complete_rate) %>%
+  print(n = Inf)
+
+vis_dat(camels_raw) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, size = 8),
+    axis.text.y = element_text(size = 8),
+    legend.text = element_text(size = 8)
+  ) +
+  labs(title = "Data Structure and Missing Values")
+
+camels_clean <- camels_raw %>% 
+  drop_na()  
+```
+
+## Data Splitting
+```{r split-data}
+set.seed(123)
+split <- initial_split(camels_clean, prop = 0.8)
+train_data <- training(split)
+test_data <- testing(split)
+```
+
+## Feature Engineering
+```{r recipe}
+rec <- recipe(q_mean ~ ., data = train_data) %>%
+  step_rm(gauge_lat, gauge_lon) %>%  
+  step_normalize(all_numeric_predictors())
+```
+
+## Resampling & Model Testing
+```{r resample-models}
+set.seed(234)
+folds <- vfold_cv(train_data, v = 10)
+
+categorical_vars <- c(
+  "gauge_id",
+  "high_prec_timing",
+  "low_prec_timing",
+  "geol_1st_class",
+  "geol_2nd_class",
+  "dom_land_cover"
+)
+
+train_data_numeric <- train_data %>%
+  mutate(across(
+    -all_of(categorical_vars),
+    ~ if(is.character(.x)) as.numeric(.x) else .x
+  ))
+
+rec_numeric <- recipe(q_mean ~ ., data = train_data_numeric) %>%
+  step_rm(gauge_lat, gauge_lon) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_dummy(all_nominal_predictors())
+
+lm_model <- linear_reg() %>% 
+  set_engine("lm") %>% 
+  set_mode("regression")
+
+rf_model <- rand_forest(
+  trees = 100,
+  min_n = 2,
+  mtry = 3
+) %>% 
+  set_engine("ranger", importance = "impurity") %>% 
+  set_mode("regression")
+
+xgb_model <- boost_tree(
+  trees = 100,
+  min_n = 2,
+  tree_depth = 3,
+  learn_rate = 0.1,
+  loss_reduction = 0.0
+) %>% 
+  set_engine("xgboost") %>% 
+  set_mode("regression")
+
+try_lm <- try(
+  fit_resamples(
+    workflow() %>% add_recipe(rec_numeric) %>% add_model(lm_model),
+    resamples = folds,
+    control = control_resamples(save_pred = TRUE, verbose = TRUE)
+  ),
+  silent = TRUE
+)
+
+try_rf <- try(
+  fit_resamples(
+    workflow() %>% add_recipe(rec_numeric) %>% add_model(rf_model),
+    resamples = folds,
+    control = control_resamples(save_pred = TRUE, verbose = TRUE)
+  ),
+  silent = TRUE
+)
+
+try_xgb <- try(
+  fit_resamples(
+    workflow() %>% add_recipe(rec_numeric) %>% add_model(xgb_model),
+    resamples = folds,
+    control = control_resamples(save_pred = TRUE, verbose = TRUE)
+  ),
+  silent = TRUE
+)
+
+if (!inherits(try_lm, "try-error")) {
+  print("Linear Model Results:")
+  print(collect_metrics(try_lm))
+}
+
+if (!inherits(try_rf, "try-error")) {
+  print("Random Forest Results:")
+  print(collect_metrics(try_rf))
+}
+
+if (!inherits(try_xgb, "try-error")) {
+  print("XGBoost Results:")
+  print(collect_metrics(try_xgb))
+}
+
+successful_models <- list()
+if (!inherits(try_lm, "try-error")) successful_models$lm <- try_lm
+if (!inherits(try_rf, "try-error")) successful_models$rf <- try_rf
+if (!inherits(try_xgb, "try-error")) successful_models$xgb <- try_xgb
+
+cat("Successfully fitted models:", paste(names(successful_models), collapse = ", "), "\n")
+
+if (length(successful_models) > 0) {
+  # Create a data frame with RMSE values
+  rmse_values <- map_dfr(names(successful_models), function(model_name) {
+    metrics <- collect_metrics(successful_models[[model_name]])
+    metrics %>%
+      filter(.metric == "rmse") %>%
+      select(mean, std_err) %>%
+      mutate(model = model_name)
+  })
+  
+  p <- ggplot(rmse_values, aes(x = model, y = mean, fill = model)) +
+    geom_col(position = "dodge") +
+    geom_errorbar(aes(ymin = mean - std_err, ymax = mean + std_err), 
+                 width = 0.2, position = position_dodge(0.9)) +
+    theme_minimal() +
+    labs(
+      title = "Model RMSE Comparison",
+      x = "Model",
+      y = "RMSE"
+    )
+  print(p)
+} else {
+  message("No models were successfully fitted. Check the model specifications and data.")
+}
+```
+
+## Model Selection
+```{r model-selection}
+tryCatch({
+  model_metrics <- list()
+  
+  if (exists("try_lm") && !inherits(try_lm, "try-error")) {
+    lm_metrics <- collect_metrics(try_lm) %>%
+      mutate(model = "Linear Regression")
+    model_metrics[["lm"]] <- lm_metrics
+  }
+  
+  if (exists("try_rf") && !inherits(try_rf, "try-error")) {
+    rf_metrics <- collect_metrics(try_rf) %>%
+      mutate(model = "Random Forest")
+    model_metrics[["rf"]] <- rf_metrics
+  }
+  
+  if (exists("try_xgb") && !inherits(try_xgb, "try-error")) {
+    xgb_metrics <- collect_metrics(try_xgb) %>%
+      mutate(model = "XGBoost")
+    model_metrics[["xgb"]] <- xgb_metrics
+  }
+  
+  if (length(model_metrics) > 0) {
+    all_metrics <- bind_rows(model_metrics)
+    
+    print("Model Performance Metrics:")
+    print(all_metrics)
+    
+    # Find best model based on RMSE
+    best_rmse <- all_metrics %>%
+      filter(.metric == "rmse") %>%
+      arrange(mean) %>%
+      slice(1)
+    
+    print("\nBest Model (lowest RMSE):")
+    print(best_rmse)
+    
+    p <- all_metrics %>%
+      filter(.metric == "rmse") %>%
+      ggplot(aes(x = model, y = mean, fill = model)) +
+      geom_col(position = "dodge") +
+      geom_errorbar(aes(ymin = mean - std_err, ymax = mean + std_err), 
+                   width = 0.2, position = position_dodge(0.9)) +
+      theme_minimal() +
+      labs(
+        title = "Model RMSE Comparison",
+        x = "Model",
+        y = "RMSE"
+      )
+    print(p)
+  } else {
+    message("No model results available for comparison")
+  }
+}, error = function(e) {
+  message("Error in model comparison:", e$message)
+})
+```
+
+## Model Tuning
+```{r tuning}
+xgb_tune <- boost_tree(
+  trees = tune(), 
+  learn_rate = tune(),
+  tree_depth = tune(),
+  min_n = tune()
+) %>% 
+  set_engine("xgboost") %>% 
+  set_mode("regression")
+
+wf_tune <- workflow() %>% 
+  add_model(xgb_tune) %>% 
+  add_recipe(rec_numeric)
+
+dials <- extract_parameter_set_dials(wf_tune)
+
+num_predictors <- ncol(train_data_numeric) - 1  # Subtract 1 for the response variable
+dials <- dials %>%
+  update(
+    trees = trees(range = c(100, 1000)),
+    learn_rate = learn_rate(range = c(-3, -1)),
+    tree_depth = tree_depth(range = c(3, 10)),
+    min_n = min_n(range = c(2, 10))
+  )
+
+my.grid <- grid_latin_hypercube(dials, size = 25)
+
+model_params <- tune_grid(
+  wf_tune,
+  resamples = folds,
+  grid = my.grid,
+  metrics = metric_set(rmse, rsq, mae),
+  control = control_grid(save_pred = TRUE)
+)
+
+autoplot(model_params)
+```
+
+## Check Best Parameters
+```{r best-hyperparameters}
+metrics_df <- collect_metrics(model_params)
+print("All metrics:")
+print(metrics_df)
+
+best_mae <- metrics_df %>%
+  dplyr::filter(.metric == "mae") %>%
+  dplyr::arrange(mean) %>%
+  dplyr::slice_head(n = 1)
+
+print("\nBest model based on MAE:")
+print(best_mae)
+
+hp_best <- select_best(model_params, metric = "mae")
+print("\nBest hyperparameters:")
+print(hp_best)
+
+p <- metrics_df %>%
+  dplyr::filter(.metric == "mae") %>%
+  ggplot(aes(x = trees, y = mean, color = as.factor(tree_depth))) +
+  geom_point() +
+  geom_line() +
+  facet_wrap(~ learn_rate, scales = "free_y") +
+  theme_minimal() +
+  labs(
+    title = "XGBoost Tuning Results",
+    x = "Number of Trees",
+    y = "Mean Absolute Error",
+    color = "Tree Depth"
+  )
+print(p)
+```
+
+## Finalize Workflow
+```{r finalize}
+final_wf <- finalize_workflow(wf_tune, hp_best)
+```
+
+## Final Model Verification
+```{r last-fit}
+final_fit <- last_fit(final_wf, split)
+
+collect_metrics(final_fit)
+
+preds <- collect_predictions(final_fit)
+ggplot(preds, aes(x = .pred, y = q_mean)) +
+  geom_point(aes(color = q_mean)) +
+  geom_smooth(method = "lm", se = FALSE) +
+  geom_abline(linetype = "dashed") +
+  scale_color_viridis_c() +
+  labs(x = "Predicted q_mean", y = "Actual q_mean", title = "Prediction vs Actual")
+```
+
+## Map Final Predictions
+```{r map-predictions}
+final_fit_model <- fit(final_wf, camels_clean)
+
+final_preds <- augment(final_fit_model, camels_clean) %>% 
+  mutate(residuals = (q_mean - .pred)^2)
+
+map_q <- ggplot(final_preds, aes(x = gauge_lon, y = gauge_lat, color = .pred)) +
+  geom_point() +
+  scale_color_viridis_c() +
+  labs(title = "Predicted q_mean")
+
+map_res <- ggplot(final_preds, aes(x = gauge_lon, y = gauge_lat, color = residuals)) +
+  geom_point() +
+  scale_color_viridis_c() +
+  labs(title = "Residuals")
+
+map_q + map_res
+```
